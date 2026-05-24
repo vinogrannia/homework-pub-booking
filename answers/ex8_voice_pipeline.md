@@ -2,29 +2,19 @@
 
 ## Your answer
 
-The voice pipeline has two modes with shared trace-event contract:
-text mode (run_text_mode, shipped complete) reads stdin and the
-manager persona replies via Llama-3.3-70B; voice mode (run_voice_mode,
-implemented here) uses Speechmatics for STT.
+In Ex8 I tested both the primary text mode and the real voice mode.
 
-The critical design choice is graceful degradation. run_voice_mode
-checks SPEECHMATICS_KEY and the speechmatics-python import before
-doing anything else. If either is missing, it logs a warning and
-falls through to run_text_mode. This means CI can pass the "voice
-loop implemented" check without Speechmatics credentials — the same
-code runs, just under the simpler transport.
+First I ran text mode with `uv run python -m starter.voice_pipeline.run --text`. The successful text session was `sess_6d37f91a65ba`. I asked Alasdair to book Haymarket Tap for 6 people on `2026-04-25` at `19:30` with a `£200` deposit. The manager accepted the booking, asked for a contact number, and confirmed after I provided `00000000000`. The narration for that session showed matching `voice.utterance_in` and `voice.utterance_out` events for every turn.
 
-Both modes emit voice.utterance_in and voice.utterance_out trace
-events with payload {text, turn, mode}. The mode field tells the
-grader which transport was in use. Same trace shape = identical
-downstream analysis.
+Then I tested real voice mode with Speechmatics STT in session `sess_12c9a188f4ba`. I ran `uv run python -m starter.voice_pipeline.run --voice`. Rime was not configured, so the system degraded gracefully: it printed manager replies instead of speaking them aloud. Speechmatics still captured my spoken input and produced audio artifacts in the workspace. The narration shows two real voice turns: I said “Hi, I would love some help with booking...” and then “Um 12.” Alasdair responded by asking how many people were in the party, then rejected the party of 12 as too large and suggested The Royal Oak for larger groups.
 
-The ManagerPersona class holds a conversation history list and calls
-an LLM for each turn. It's deterministic given identical history +
-model seed, which makes the tests stable even though we talk to a
-real model.
+This confirms the Ex8 trace contract in both modes: each user utterance is recorded as `voice.utterance_in`, and each manager reply is recorded as `voice.utterance_out`. Voice mode also wrote recorded input files, including `workspace\turn_0_input.wav` and `workspace\turn_1_input.wav`.
 
 ## Citations
 
-- starter/voice_pipeline/voice_loop.py — run_voice_mode
-- starter/voice_pipeline/manager_persona.py — LLM-backed persona
+- Text session: `sess_6d37f91a65ba`
+- Text trace: `C:\Users\const\AppData\Local\sovereign-agent\homework\ex8\sess_6d37f91a65ba\logs\trace.jsonl`
+- Voice session: `sess_12c9a188f4ba`
+- Voice trace: `C:\Users\const\AppData\Local\sovereign-agent\homework\ex8\sess_12c9a188f4ba\logs\trace.jsonl`
+- Voice artifacts: `workspace\turn_0_input.wav`, `workspace\turn_1_input.wav`
+- Voice narration: `You said: Hi ! I would love some help with booking a book .`, `Agent said: Too many, I'm afraid. Try The Royal Oak, they can handle larger groups.`

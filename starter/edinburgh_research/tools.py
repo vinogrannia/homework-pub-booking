@@ -14,10 +14,14 @@ The grader checks for:
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
+from sovereign_agent.errors import ToolError
 from sovereign_agent.session.directory import Session
 from sovereign_agent.tools.registry import ToolRegistry, ToolResult, _RegisteredTool
+
+from .integrity import record_tool_call
 
 _SAMPLE_DATA = Path(__file__).parent / "sample_data"
 
@@ -43,7 +47,55 @@ def venue_search(near: str, party_size: int, budget_max_gbp: int = 1000) -> Tool
     """
     # TODO 1a: load venues.json. Raise ToolError(SA_TOOL_DEPENDENCY_MISSING)
     #          if the file is absent.
-    raise NotImplementedError("TODO 1: implement venue_search")
+
+    path = _SAMPLE_DATA / "venues.json"
+
+    if not path.exists():
+        raise ToolError(
+            code="SA_TOOL_DEPENDENCY_MISSING",
+            message="venues.json is missing",
+            context={"path": str(path)},
+        )
+
+    venues = json.loads(path.read_text(encoding="utf-8"))
+
+    near_lower = near.lower()
+
+    results = []
+
+    for venue in venues:
+        if not venue["open_now"]:
+            continue
+        if near_lower not in venue["area"].lower():
+            continue
+        if venue["seats_available_evening"] < party_size:
+            continue
+
+        total_required = venue["hire_fee_gbp"] + venue["min_spend_gbp"]
+
+        if total_required > budget_max_gbp:
+            continue
+
+        results.append(venue)
+
+    output = {
+        "near": near,
+        "party_size": party_size,
+        "results": results,
+        "count": len(results),
+    }
+
+    record_tool_call(
+        "venue_search",
+        {"near": near, "party_size": party_size, "budget_max_gbp": budget_max_gbp},
+        output,
+    )
+
+    return ToolResult(
+        success=True,
+        output=output,
+        summary=f"venue_search({near}, party={party_size}): {len(results)} result(s)",
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -61,7 +113,68 @@ def get_weather(city: str, date: str) -> ToolResult:
 
     MUST call record_tool_call(...) before returning.
     """
-    raise NotImplementedError("TODO 2: implement get_weather")
+    path = _SAMPLE_DATA / "weather.json"
+
+    if not path.exists():
+        raise ToolError(
+            code="SA_TOOL_DEPENDENCY_MISSING",
+            message="weather.json is missing",
+            context={"path": str(path)},
+        )
+
+    weather_data = json.loads(path.read_text(encoding="utf-8"))
+
+    city_lower = city.lower()
+
+    if city_lower not in weather_data:
+        error = ToolError(
+            code="SA_TOOL_INVALID_INPUT",
+            message=f"No weather data for city: {city}",
+            context={"city": city},
+        )
+
+        return ToolResult(
+            success=False,
+            output={},
+            summary=str(error),
+            error=error,
+        )
+
+    city_weather = weather_data[city_lower]
+
+    if date not in city_weather:
+        error = ToolError(
+            code="SA_TOOL_INVALID_INPUT",
+            message=f"No weather data for {city} on {date}",
+            context={"city": city, "date": date},
+        )
+
+        return ToolResult(
+            success=False,
+            output={},
+            summary=str(error),
+            error=error,
+        )
+
+    weather_for_date = city_weather[date]
+
+    output = {
+        "city": city,
+        "date": date,
+        **weather_for_date,
+    }
+
+    record_tool_call(
+        "get_weather",
+        {"city": city, "date": date},
+        output,
+    )
+
+    return ToolResult(
+        success=True,
+        output=output,
+        summary=f"get_weather({city}, {date}): {output['condition']}, {output['temperature_c']}C",
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -98,10 +211,113 @@ def calculate_cost(
 
     MUST call record_tool_call(...) before returning.
     """
-    raise NotImplementedError("TODO 3: implement calculate_cost")
+    catering_path = _SAMPLE_DATA / "catering.json"
+    venues_path = _SAMPLE_DATA / "venues.json"
+
+    if not catering_path.exists():
+        raise ToolError(
+            code="SA_TOOL_DEPENDENCY_MISSING",
+            message="catering.json is missing",
+            context={"path": str(catering_path)},
+        )
+
+    if not venues_path.exists():
+        raise ToolError(
+            code="SA_TOOL_DEPENDENCY_MISSING",
+            message="venues.json is missing",
+            context={"path": str(venues_path)},
+        )
+
+    catering = json.loads(catering_path.read_text(encoding="utf-8"))
+    venues = json.loads(venues_path.read_text(encoding="utf-8"))
+
+    selected_venue = None
+
+    for venue in venues:
+        if venue["id"] == venue_id:
+            selected_venue = venue
+            break
+
+    if selected_venue is None:
+        error = ToolError(
+            code="SA_TOOL_INVALID_INPUT",
+            message=f"Unknown venue_id: {venue_id}",
+            context={"venue_id": venue_id},
+        )
+
+        return ToolResult(
+            success=False,
+            output={},
+            summary=str(error),
+            error=error,
+        )
+
+    base_rates = catering["base_rates_gbp_per_head"]
+
+    if catering_tier not in base_rates:
+        error = ToolError(
+            code="SA_TOOL_INVALID_INPUT",
+            message=f"Unknown catering_tier: {catering_tier}",
+            context={"catering_tier": catering_tier},
+        )
+
+        return ToolResult(
+            success=False,
+            output={},
+            summary=str(error),
+            error=error,
+        )
+
+    base_per_head = base_rates[catering_tier]
+    venue_mult = catering["venue_modifiers"][venue_id]
+    hours = max(1, duration_hours)
+
+    subtotal = base_per_head * venue_mult * party_size * hours
+    service = subtotal * catering["service_charge_percent"] / 100
+
+    venue_minimum = selected_venue["hire_fee_gbp"] + selected_venue["min_spend_gbp"]
+    total = subtotal + service + venue_minimum
+
+    subtotal_gbp = round(subtotal)
+    service_gbp = round(service)
+    total_gbp = round(total)
+
+    if total_gbp < 300:
+        deposit_required_gbp = 0
+    elif total_gbp <= 1000:
+        deposit_required_gbp = round(total_gbp * 0.20)
+    else:
+        deposit_required_gbp = round(total_gbp * 0.30)
+
+    output = {
+        "venue_id": venue_id,
+        "party_size": party_size,
+        "duration_hours": duration_hours,
+        "catering_tier": catering_tier,
+        "subtotal_gbp": subtotal_gbp,
+        "service_gbp": service_gbp,
+        "total_gbp": total_gbp,
+        "deposit_required_gbp": deposit_required_gbp,
+    }
+
+    record_tool_call(
+        "calculate_cost",
+        {
+            "venue_id": venue_id,
+            "party_size": party_size,
+            "duration_hours": duration_hours,
+            "catering_tier": catering_tier,
+        },
+        output,
+    )
+
+    return ToolResult(
+        success=True,
+        output=output,
+        summary=f"calculate_cost({venue_id}, {party_size}): total £{total_gbp}, deposit £{deposit_required_gbp}",
+    )
 
 
-# ---------------------------------------------------------------------------
 # TODO 4 — generate_flyer
 # ---------------------------------------------------------------------------
 def generate_flyer(session: Session, event_details: dict) -> ToolResult:
@@ -126,7 +342,123 @@ def generate_flyer(session: Session, event_details: dict) -> ToolResult:
     IMPORTANT: this tool MUST be registered with parallel_safe=False
     because it writes a file.
     """
-    raise NotImplementedError("TODO 4: implement generate_flyer")
+    required_fields = [
+        "venue_name",
+        "venue_address",
+        "date",
+        "time",
+        "party_size",
+        "condition",
+        "temperature_c",
+        "total_gbp",
+        "deposit_required_gbp",
+    ]
+
+    missing_fields = []
+
+    for field in required_fields:
+        if field not in event_details:
+            missing_fields.append(field)
+
+    if missing_fields:
+        error = ToolError(
+            code="SA_TOOL_INVALID_INPUT",
+            message="event_details is missing required fields",
+            context={"missing_fields": missing_fields},
+        )
+
+        return ToolResult(
+            success=False,
+            output={},
+            summary=str(error),
+            error=error,
+        )
+
+    html_content = f"""<!doctype html>
+<html>
+<head>
+    <meta charset="utf-8">
+    <title>{event_details["venue_name"]} booking flyer</title>
+    <style>
+        body {{
+            font-family: Arial, sans-serif;
+            margin: 40px;
+            background: #f7f3ea;
+            color: #222;
+        }}
+        main {{
+            max-width: 760px;
+            margin: 0 auto;
+            padding: 24px;
+            background: white;
+            border: 2px solid #333;
+        }}
+        h1 {{
+            margin-top: 0;
+        }}
+        dt {{
+            font-weight: bold;
+            margin-top: 12px;
+        }}
+        dd {{
+            margin-left: 0;
+        }}
+    </style>
+</head>
+<body>
+    <main>
+        <h1 data-testid="venue_name">{event_details["venue_name"]}</h1>
+
+        <dl>
+            <dt>Address</dt>
+            <dd data-testid="venue_address">{event_details["venue_address"]}</dd>
+
+            <dt>Date</dt>
+            <dd data-testid="date">{event_details["date"]}</dd>
+
+            <dt>Time</dt>
+            <dd data-testid="time">{event_details["time"]}</dd>
+
+            <dt>Party size</dt>
+            <dd data-testid="party_size">{event_details["party_size"]}</dd>
+
+            <dt>Weather</dt>
+            <dd>
+                <span data-testid="condition">{event_details["condition"]}</span>,
+                <span data-testid="temperature_c">{event_details["temperature_c"]}C</span>
+            </dd>
+
+            <dt>Total cost</dt>
+            <dd data-testid="total_gbp">£{event_details["total_gbp"]}</dd>
+
+            <dt>Deposit required</dt>
+            <dd data-testid="deposit_required_gbp">£{event_details["deposit_required_gbp"]}</dd>
+        </dl>
+    </main>
+</body>
+</html>
+"""
+
+    flyer_path = session.path("workspace/flyer.html")
+    flyer_path.parent.mkdir(parents=True, exist_ok=True)
+    flyer_path.write_text(html_content, encoding="utf-8")
+
+    output = {
+        "path": "workspace/flyer.html",
+        "bytes_written": len(html_content.encode("utf-8")),
+    }
+
+    record_tool_call(
+        "generate_flyer",
+        {"event_details": event_details},
+        output,
+    )
+
+    return ToolResult(
+        success=True,
+        output=output,
+        summary=f"generate_flyer: wrote workspace/flyer.html ({len(html_content)} chars)",
+    )
 
 
 # ---------------------------------------------------------------------------
